@@ -1,0 +1,572 @@
+---
+Title: "Project in Multi-Omics"
+Student: Francisco Martinho | 73349
+Supervisor: Tomás Gomes
+Place: Luis Graça Lab at GIMM
+---
+
+@Vision
+#Seurat
+
+```{r}
+
+install.packages("hdf5r")
+install.packages("arrow")
+
+```
+
+```{r}
+#Call libraries
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+```
+
+```{r}
+localdir <- "151507.h5seurat"
+
+object <- Load10X_Spatial(data.dir = localdir, bin.size = c(8, 16))
+
+# Setting default assay changes between 8um and 16um binning
+Assays(object)
+DefaultAssay(object) <- "Spatial.008um"
+```
+
+
+#Bioconductor
+
+```{r}
+#Packages instalation
+#estou a ter alguns problemas a instalar os packages
+BiocManager::install("VisiumIO")
+```
+
+@Xenium
+
+#Este será o foco do projeto, o resto do estudo/aprendizagem será realizado de forma extracurricular.
+
+#Objetivos do Projeto:
+
+->Encontrar dominios nas estrutura visualizada.
+->Correlacionar domínios, tipo quando um domínio é encontrado se é frequente visualiazar outros associados.
+->Encontrar os tipos celulares presentes nas amostras analisadas, maybe também encontrar correlações nomeadamente na zona Tertiary Lymphoid Structures(TLS) (não me recordo se era este o nome) organized immune cell clusters within non-lymphatic tissue that may cause tissue degradation. (Dá para ter uma ideia de uma possivel evolução da infiltration)
+
+#Xenium 
+```{r}
+#Packages instalation
+
+bioc_pkgs <- c(
+    "scran", "scater", "scuttle", "SingleR", "OSTA.data", 
+    "BayesSpace", "BiocParallel", "DropletUtils", 
+    "SpatialExperiment", "SpatialExperimentIO")
+
+cran_pkgs <- c("dplyr", "tidyr", "ggplot2", "patchwork", "igraph")
+
+BiocManager::install(bioc_pkgs)
+install.packages(cran_pkgs)
+
+```
+
+```{r}
+#Call libraries
+library(dplyr)
+library(tidyr)
+#library(scran)
+library(igraph)
+library(scater)
+library(scuttle)
+library(SingleR)
+library(ggplot2)
+library(patchwork)
+library(OSTA.data) 
+library(BayesSpace)
+library(BiocParallel)
+library(DropletUtils)
+library(SpatialExperiment)
+library(SpatialExperimentIO) 
+```
+
+#1.Introduction
+
+```{r}
+# set parallelization. reduces computational effort
+bp <- MulticoreParam(4)
+
+# set seed for random number generation
+# in order to make results reproducible
+set.seed(112358)
+```
+
+```{r}
+id <- "Xenium_HumanColon_Oliveira"
+pa <- OSTA.data_load(id, mol=TRUE) #Descarrega os dados do repositório OSTA para o meu PC
+#unzip(pa, exdir=td)
+
+```
+
+```{r}
+#Função feita manualmente
+
+id <- "Xenium_HumanColon_Oliveira"
+bfc = BiocFileCache::BiocFileCache()
+mol=TRUE
+pol=T
+url = "https://osf.io/5n4q3"
+
+id <- match.arg(id, OSTA.data_list(url))
+q <- BiocFileCache:::bfcquery(bfc, id)
+n <- nrow(q)
+i <- 1
+if (n > 1) {
+  message("multiple 'id' hits; using last")
+  i <- n
+} else if (n > 0) {
+  return(q$rpath[i])
+}
+no <- osfr::osf_retrieve_node(url)
+df <- osfr::osf_ls_files(no, id)
+if (!pol) 
+  df = df[!grepl("bound|poly", df$name), ]
+if (!mol) 
+  df <- df[!grepl("tx|scripts", df$name), ]
+dir.create(td <- "C:\\Users\\fmmar\\OneDrive\\Documentos\\aux_functions")
+osfr::osf_download(df, td, recurse = TRUE)
+```
+
+```{r}
+#Starts here
+td <- "C:\\Users\\fmmar\\OneDrive\\Documentos\\aux_functions"
+(spe <- readXeniumSXE(td, addTx=FALSE)) #Corre o ficheiro e cria um objeto SpatialExperiment (SPE) com os dados dos genes, células, coordenadas...
+```
+
+
+```{r}
+#Para visualizar os dados das colunas no mapa.
+.plt_xy <- \(spe, col) {
+    df <- data.frame(colData(spe), spatialCoords(spe))
+    aes <- if (is.numeric(df[[col]])) {
+        theme(
+            legend.key.height=unit(1, "lines"), 
+            legend.key.width=unit(0.5, "lines"))
+    } else {
+        list(
+            theme(legend.key.size=unit(0, "lines")),
+            guides(col=guide_legend(override.aes=list(alpha=1, size=2))))
+    }
+    ggplot(df, aes(x_centroid, y_centroid, col=.data[[col]])) +
+        coord_equal() + theme_void() + aes +
+        geom_point(stroke=0, size=1/3)
+} 
+```
+
+#2.Quality Control
+
+```{r}
+# compute cell-level QC metrics
+spe <- addPerCellQCMetrics(spe) #A documentação não deu, mas acho que para cada célula, o R conta o total de moléculas de RNA detetadas (sum) e o número de genes diferentes que estão ativos (detected).
+
+# identify low-quality cells by thresholding on
+# median absolute deviation (MAD) from the median
+ol <- perCellQCFilters(spe) #Encontra outliers a serem excluídos, mas isso refere-se a grandes desvios na quantidade de mRNA?
+
+# O # (Soma): Mostra o número absoluto de células que falharam em cada critério (ex: poucas contagens, poucos genes detetados). O % (Percentagem): Mostra a proporção de células descartadas.
+data.frame(
+    check.names=FALSE,
+    `#`=apply(ol, 2, sum), 
+    `%`=round(100*apply(ol, 2, mean), 2))
+```
+
+```{r}
+#Visualizar se faz sentido remover essas células. 1ªFig. mRNA counts (atividade genética), 2ªFig. diversidade genética (zonas com muitos counts mas pouca diversidade mostra que existem genes a dominarem a expressão, p.e), 3ªFig qualidade das células)
+
+spe$ol <- ol$discard
+.plt_xy(spe, "sum") +  
+    scale_color_viridis_c(
+        "# counts", 
+        trans="log1p",
+        breaks=range(spe$sum), 
+        labels=c("low", "high")) +
+.plt_xy(spe, "detected") +
+    scale_color_viridis_c(
+        "# features", 
+        breaks=range(spe$detected), 
+        labels=c("low", "high")) +
+.plt_xy(spe[, order(spe$ol)], "ol") + 
+    scale_color_manual(
+        "low-quality",
+        labels=c("no", "yes"),
+        values=c("lavender", "purple"))
+```
+
+```{r}
+# discard low-quality cells
+ncol(spe <- spe[, !ol$discard])
+```
+R.: Passou-se de 340837 células para 325524. Gostava de saber quais os pressupostos das funções que fizeram a limpeza (tipo os tresholds)
+
+#3. Processing
+
+```{r}
+#We will perform downstream analyses only on a square crop of the tissue.
+
+box <- list(xmin=2e3, xmax=5e3, ymin=1e3, ymax=4e3)
+
+#Cropping to this region
+
+xy <- spatialCoords(spe)
+i <- 
+    xy[, 1] > box$xmin &
+    xy[, 1] < box$xmax &
+    xy[, 2] > box$ymin &
+    xy[, 2] < box$ymax 
+ncol(sub <- spe[, i]) #tell how many cells are within this region
+
+```
+R.: Nesta região temos 88863 células e o mesmo numero de genes (422)
+
+
+```{r}
+df <- data.frame(xy, i)
+p <- ggplot(df, 
+    aes(x_centroid, y_centroid)) +
+    coord_equal() + theme_void() + 
+    theme(legend.position="none")
+p + geom_point(aes(col=i), stroke=0, size=0.1) |
+p + geom_point(data=df[i, ], stroke=0, size=0.2)
+```
+
+
+#4. Normalization
+
+```{r}
+# Normaliza os dados dividindo as contagens pela área de cada célula
+# para que células grandes e pequenas possam ser comparadas de forma justa.
+
+logcounts(sub) <- sweep(assay(sub), 2, sub$cell_area, `/`) #percorre cada coluna (2), ou seja cada célula e divide cada linha (genes) pelo tamanho da célula.
+
+```
+
+#5. Perform PCA
+
+```{r}
+# principal component analysis
+sub <- runPCA(sub) #Faz também o centering
+```
+
+#6. Scaling and gene visualization.
+
+```{r}
+gs <- c("PIGR", "IGHG3", "CEACAM6")
+es <- scale(logcounts(sub)) #Penso que isto seja o scaling, logo deveria ser para normalizar a expressão genética em cada célula de forma a serem comparáveis, impedindo que genes que sejam muito expressos tenham mais relevância que outros que não são tanto.
+
+es <- t(as.matrix(es[gs, ])) #transposta, genes passam as ser colunas e células linhas (muda o protagonista no fundo)
+
+colData(sub) <- cbind(colData(sub), es) #adiciona os dados de expressão de cada gene à metadata
+
+ps <- lapply(gs, \(.) .plt_xy(sub, .) + ggtitle(.))
+wrap_plots(ps, nrow=1) &
+    scale_color_gradientn(NULL, 
+        labels=c("low", "high"), 
+        colors=rev(hcl.colors(9, "PuRd")),
+        limits=rng, breaks=rng <- range(es)) & 
+    theme(plot.title=element_text(hjust=0.5))
+```
+
+O scaling foi feito depois do PCA porque a variância não interpretada como sendo igual para todas as células, sendo por isso biologicamente informativo e relevante para o PCA. Assim, o agrupamento dos genes mais diferencialmente expressos tem significado biologico, que não foi omitido por um possivel scaling anterior ao PCA.
+
+
+#7.Annotation
+
+#7.1. Unsupervised
+
+```{r}
+# shared nearest-neighbor (SNN) graph based on 
+# cell-to-cell Jaccard similarity in PC space. jaccard é uma medida estatística que calcula a força da ligação entre as células. Quanto mais vizinhos partilharem, mais forte é a ligação.
+g <- buildSNNGraph(sub, use.dimred="PCA", type="jaccard", BPPARAM=bp) 
+
+# community detection using Leiden algorithm
+k <- cluster_leiden(g, objective_function="modularity", resolution=0.7) #Este algoritmo "corta" a rede em grupos (clusters). Ele procura áreas na rede onde as conexões são muito densas internamente e mais afastados para o exterior. Para resolução usei clustree analysis (será que vale a pena?)
+
+table(sub$Leiden <- factor(. <- k$membership, labels=letters[seq_along(unique(.))]))
+```
+
+#7.2. Supervised
+
+```{r}
+# retrieve dataset from OSF repository
+id <- "Chromium_HumanColon_Oliveira"
+pa <- OSTA.data_load(id)
+dir.create(td)
+# read into 'SingleCellExperiment'
+sce <- read10xCounts(list.files(td, "h5$", full.names=TRUE))
+cd <- read.csv(list.files(td, "cell_meta", full.names=TRUE))
+colData(sce) <- cbind(colData(sce), cd[, -1])
+table(sce$Level1) # tabulate low-res. labels
+ncol(sce) # overall number of cells
+```
+
+curl -o "rat_data_xenium.zip" "https://cf.10xgenomics.com/samples/xenium/1.0.2/Xenium_V1_FF_Mouse_Brain_Coronal_Subset_CTX_HP/Xenium_V1_FF_Mouse_Brain_Coronal_Subset_CTX_HP_outs.zip"
+
+
+#Xemium no Seurat (oremos para que dê)
+```{r}
+
+#Start here
+
+library(Seurat)
+library(future)
+plan("multisession", workers = 10)
+library(ggplot2)
+
+options(future.globals.maxSize = 10 * 1024^3)
+
+#Load Object
+xenium.obj<-LoadXenium("C:\\Users\\fmmar\\OneDrive\\Ambiente de Trabalho\\Universidade\\Mestrado\\1º Ano\\Periodo Intercalar\\Multi-Omics Project\\data\\rat_data_xenium",fov='fov',segmentations='cell')
+
+```
+R.: We start we 36602 cells.
+
+
+#1. Quality Control
+```{r}
+#Are there cells with 0 mRNA counts?
+empty_cells<-length(xenium.obj@meta.data$nCount_Xenium[xenium.obj@meta.data$nCount_Xenium==0]) #Yes, 49 cells
+
+length(xenium.obj@meta.data$nCount_Xenium) - empty_cells #36602 cells remaining
+
+#Lets remove them
+xenium.obj <- subset(xenium.obj, subset = nCount_Xenium > 0)
+
+length(xenium.obj@meta.data$nCount_Xenium) #yup,36602 cells remaining
+
+```
+
+```{r}
+#QC plots | nFeatures and nCounts 
+
+VlnPlot(xenium.obj, features = c("nFeature_Xenium", "nCount_Xenium"), ncol = 2, pt.size = 0)
+```
+```{r}
+#Valores máximos e mínimos para melhorar perceção
+
+max(xenium.obj@meta.data$nFeature_Xenium) #158
+min(xenium.obj@meta.data$nFeature_Xenium) #1
+
+max(xenium.obj@meta.data$nCount_Xenium) #1448
+min(xenium.obj@meta.data$nCount_Xenium) #1
+```
+
+Vou seguir o seurat (https://satijalab.org/seurat/articles/seurat5_spatial_vignette_2) e vou fazer uma análise do tamanho celular  para perceber se existe correlação (graficamente) entre nFeature_Xenium e nCount_Xenium. A ideia é perceber também se devemos usar um upper cutf off no nCount_Xenium porque se a media de genes é ~75 , mas existem nCount_Xenium bue altos (acima de 1000), o que ou podem ser células grande ou doblets, e por isso deverá ser corrigido.
+
+```{r}
+#Lets see how nCounts and nFeatures impact the cluster segmentation
+
+
+xenium.obj <- SCTransform(xenium.obj, assay = "Xenium") #negative control eheh
+xenium.obj <- RunPCA(xenium.obj, npcs = 30, features = rownames(xenium.obj)) 
+xenium.obj <- RunUMAP(xenium.obj, dims = 1:30)
+xenium.obj <- FindNeighbors(xenium.obj, reduction = "pca", dims = 1:30)
+xenium.obj <- FindClusters(xenium.obj, resolution = 0.3)
+
+area_vec = sapply(xenium.obj@images$fov@boundaries$segmentations@polygons, function(x) x@area)
+names(area_vec) = colnames(xenium.obj)
+xenium.obj = Seurat::AddMetaData(xenium.obj, area_vec, col.name = "area")
+
+xenium.obj_size <- SCTransform(xenium.obj, assay = "Xenium", vars.to.regress='area')
+xenium.obj_size <- RunPCA(xenium.obj_size, npcs = 30, features = rownames(xenium.obj_size)) 
+xenium.obj_size <- RunUMAP(xenium.obj_size, dims = 1:30)
+xenium.obj_size <- FindNeighbors(xenium.obj_size, reduction = "pca", dims = 1:30)
+xenium.obj_size <- FindClusters(xenium.obj_size, resolution = 0.3)
+
+xenium.obj_nF <- SCTransform(xenium.obj, assay = "Xenium",vars.to.regress='nFeature_Xenium')
+xenium.obj_nF <- RunPCA(xenium.obj_nF, npcs = 30, features = rownames(xenium.obj_nF)) 
+xenium.obj_nF <- RunUMAP(xenium.obj_nF, dims = 1:30)
+xenium.obj_nF <- FindNeighbors(xenium.obj_nF, reduction = "pca", dims = 1:30)
+xenium.obj_nF <- FindClusters(xenium.obj_nF, resolution = 0.3)
+
+xenium.obj_nC <- SCTransform(xenium.obj, assay = "Xenium",vars.to.regress='nCount_Xenium')
+xenium.obj_nC <- RunPCA(xenium.obj_nC, npcs = 30, features = rownames(xenium.obj_nC)) 
+xenium.obj_nC <- RunUMAP(xenium.obj_nC, dims = 1:30)
+xenium.obj_nC <- FindNeighbors(xenium.obj_nC, reduction = "pca", dims = 1:30)
+xenium.obj_nC <- FindClusters(xenium.obj_nC, resolution = 0.3)
+
+
+DimPlot(xenium.obj, reduction = "umap")+ggtitle('UMAP without removing any variable')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj, reduction = "umap",features = "nFeature_Xenium")+ggtitle('UMAP before removing nFeatures')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_nF, reduction = "umap",features = "nFeature_Xenium")+ggtitle('UMAP after removing nFeatures')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj, reduction = "umap",features = "nCount_Xenium")+ggtitle('UMAP before removing nCounts')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_nC, reduction = "umap",features = "nCount_Xenium")+ggtitle('UMAP after removing nCounts')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj, reduction = "umap",features = "area")+ggtitle('UMAP before removing Area (cell size)')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_size, reduction = "umap",features = "area")+ggtitle('UMAP after removing Area (cell size)')+ theme(plot.title = element_text(hjust = 0.5))
+```
+Pelos FeaturePlots estas variáveis não aparentam causar uma divisão dos cluster, no entanto o nCounts até parece existir uma separação intraclusters. Para ter uma outra noção vou ver o gráfico do Diogo (principal component regression).
+
+```{r}
+#Principal component regression
+library(scater)
+pcs <- Embeddings(xenium.obj, "pca") #matriz com as células em cada PC
+xs <- c("nCount_Xenium","nFeature_Xenium","area")
+
+pcr <- lapply(xs, function(x) {
+    fit <- summary(lm(pcs ~ xenium.obj@meta.data[[x]]))
+    r2 <- sapply(fit, \(.) .$adj.r.squared)
+    data.frame(x, pc=seq_along(r2), r2)
+}) |> do.call(what=rbind)
+
+ggplot(pcr, aes(pc, r2, col=x)) +
+    geom_line() + geom_point() +
+    coord_cartesian(xlim=c(1, 20))
+```
+Codigo do plot (https://github.com/GIMM-BioCode/2025-Autumn-School-for-Single-Cell-ers/tree/main/Day2_Muscat-Milo)
+
+```{r}
+library(plotly)
+ggplotly(ElbowPlot(xenium.obj,ndims=50))
+```
+
+
+#2 Data analysis
+
+```{r}
+#For marker localization
+ImageDimPlot(xenium.obj, fov = "fov", molecules = c("Gad1", "Sst", "Pvalb", "Gfap"), nmols = 20000)
+```
+```{r}
+#For markers levels of expression
+ImageFeaturePlot(xenium.obj, features = c("Cux2", "Rorb", "Bcl11b", "Foxp2"), max.cutoff = c(25,35, 12, 10), size = 0.75, cols = c("white", "red"))
+```
+```{r}
+cropped.coords <- Crop(xenium.obj[["fov"]], x = c(1200, 2900), y = c(3750, 4550), coords = "plot")
+xenium.obj[["zoom"]] <- cropped.coords # we are now working with 3958 cells
+
+# visualize cropped area with cell segmentations & selected molecules
+DefaultBoundary(xenium.obj[["zoom"]]) <- "segmentation"
+ImageDimPlot(xenium.obj, fov = "zoom", axes = TRUE, border.color = "white", border.size = 0.1, cols = "polychrome",
+    coord.fixed = FALSE, molecules = c("Gad1", "Sst", "Npy2r", "Pvalb", "Nrn1"), nmols = 10000)
+```
+
+
+#Normalization, linear and non-linear Dimensional reduction, Neighbor Joining and Clustering
+```{r}
+xenium.obj <- SCTransform(xenium.obj, assay = "Xenium") #Normalization e scale ; ir experimentando diferentes valores para o variable.features.n e variable.features.rv.th, mas o mais interessante será tendo-os igual a NULL. Ver o vars.to.regress= para nCount e nFeatures cell size e ver como impacta a distribuição no UMAP (se antes estavam separados consoante alguma destas variáveis e após o regress, que no fundo remove-as, já não estão então é porque estavam a causar bias)
+xenium.obj <- RunPCA(xenium.obj, npcs = 30, features = rownames(xenium.obj)) 
+xenium.obj <- RunUMAP(xenium.obj, dims = 1:30)
+xenium.obj <- FindNeighbors(xenium.obj, reduction = "pca", dims = 1:30)
+xenium.obj <- FindClusters(xenium.obj, resolution = 0.3)
+```
+Duvidas:
+Por responder:
+
+Respondidas:
+Não fazemos o scaling, após o PCA? Não, embora o SCTransform faça Normalização (divide counts pelos pelos total counts), faz uma parte do scaling (falando do processo geral), que é o centering (dividir pela media), mas não faz a substração do desvio padrão (também designado de scaling), no entanto este último segundo o Tomás não será relevante.  Não usamos elbow plot e ficamos com os PCs defaults? Usamos sim.
+Vale a pena usar clustree para averiguar se a resolution está correta? Vale.
+O UMAP não deu igual e tem um cluster a menos, é normal? É
+As cores das ImageDimPlot estão muito diferentes das da vignette. é das bordas dos circulos serem brancas.
+
+Coisas a fazer depois de ter as duvidas respondidas:
+->ir experimentando diferentes valores para o variable.features.n e variable.features.rv.th, mas o mais interessante será tendo-os igual a NULL (quando tiver o dataset). 
+->Ver o vars.to.regress= para nCount e nFeature, cell size e ver como impacta a distribuição no UMAP (se antes estavam separados consoante alguma destas variáveis e após o regress, que no fundo remove-as, já não estão então é porque estavam a causar bias. FEITO
+->elbowplot antes do PCA . package (elbow), func (elbow), fiz com a func que conhecia
+->clustree 
+->remover as bordas brancas dos circulos
+-> Curti bue do ggplotly() do library(plotly), para graficos interativos.
+
+```{r}
+#visualize the results of the clustering by coloring each cell according to its cluster in UMAP space
+DimPlot(xenium.obj, reduction = 'umap')
+```
+
+```{r}
+# Visualize the expression level of the markers we looked at earlier on the UMAP coordinates.
+
+FeaturePlot(xenium.obj, features = c("Cux2", "Bcl11b", "Foxp2", "Gad1", "Sst", "Gfap"))
+```
+```{r}
+# Visualize the cell positions colored by the cluster labels determined in the previous step.
+
+p<-ImageDimPlot(xenium.obj, cols = "polychrome", size = 0.75)
+library(plotly)
+ggplotly(p)
+```
+
+
+
+```{r}
+#Another way to see a specific region
+par(mfrow=c(2,1))
+p1 <- ImageFeaturePlot(xenium.obj, features = "Slc17a7", axes = TRUE, max.cutoff = "q90")
+crop <- Crop(xenium.obj[["fov"]], x = c(600, 2100), y = c(900, 4700))
+xenium.obj[["crop"]] <- crop
+p2 <- ImageFeaturePlot(xenium.obj, fov = "crop", features = "Slc17a7", size = 1, axes = TRUE, max.cutoff = "q90")
+p1
+p2
+```
+
+#Decomposition
+
+```{r}
+#Install RCTD (for cell anotation)
+devtools::install_github("dmcable/spacexr", build_vignettes = FALSE)
+```
+
+```{r}
+library(spacexr)
+
+query.counts <- GetAssayData(xenium.obj, assay = "Xenium", layer = "counts")[, Cells(xenium.obj[["fov"]])]
+coords <- GetTissueCoordinates(xenium.obj[["fov"]], which = "centroids")
+rownames(coords) <- coords$cell
+coords$cell <- NULL
+query <- SpatialRNA(coords, query.counts, colSums(query.counts)) #Returns SpatialRNA object containing the coordinates and counts from the input file
+```
+
+```{r}
+allen.cortex.ref <-readRDS("C:\\Users\\fmmar\\OneDrive\\Ambiente de Trabalho\\Universidade\\Mestrado\\1º Ano\\Periodo Intercalar\\Multi-Omics Project\\data\\testing the script\\allen_cortex.rds")
+allen.cortex.ref <- UpdateSeuratObject(allen.cortex.ref)
+
+Idents(allen.cortex.ref) <- "subclass"
+# remove CR cells because there aren't enough of them for annotation
+allen.cortex.ref <- subset(allen.cortex.ref, subset = subclass != "CR")
+counts <- GetAssayData(allen.cortex.ref, assay = "RNA", layer = "counts")
+cluster <- as.factor(allen.cortex.ref$subclass)
+names(cluster) <- colnames(allen.cortex.ref)
+nUMI <- allen.cortex.ref$nCount_RNA
+names(nUMI) <- colnames(allen.cortex.ref)
+nUMI <- colSums(counts)
+levels(cluster) <- gsub("/", "-", levels(cluster))
+reference <- Reference(counts, cluster, nUMI) #como é que sabem qual célula é de que se nao vão usar genes, apenas counts?
+```
+
+```{r}
+RCTD <- create.RCTD(query, reference, max_cores = 8)
+RCTD <- run.RCTD(RCTD, doublet_mode = "doublet")
+annotations.df <- RCTD@results$results_df
+annotations <- annotations.df$first_type
+names(annotations) <- rownames(annotations.df)
+xenium.obj$predicted.celltype <- annotations
+keep.cells <- Cells(xenium.obj)[!is.na(xenium.obj$predicted.celltype)]
+xenium.obj <- subset(xenium.obj, cells = keep.cells)
+```
+#Niches (Cell type composition of the neighbourhood of each cell)
+
+```{r}
+xenium.obj <- BuildNicheAssay(object = xenium.obj, fov = "fov", group.by = "predicted.celltype",niches.k = 5, neighbors.k = 30)
+```
+
+```{r}
+#classification of cell groups eith based on their cell type or thei niche identity
+celltype.plot <- ImageDimPlot(xenium.obj, group.by = "predicted.celltype", size = 1.5, cols = "polychrome",
+    dark.background = F) + ggtitle("Cell type")
+niche.plot <- ImageDimPlot(xenium.obj, group.by = "niches", size = 1.5, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("#442288", "#6CA2EA", "#B5D33D", "#FED23F", "#EB7D5B"))
+celltype.plot | niche.plot
+```
+
+
+#composition of each niche is enriched for distinct cell types.
+```{r}
+table(xenium.obj$predicted.celltype, xenium.obj$niches)
+
+```
+
