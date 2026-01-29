@@ -1,0 +1,365 @@
+---
+Title: "Project in Multi-Omics"
+Student: Francisco Martinho | 73349
+Supervisor: Tomás Gomes
+Place: Luis Graça Lab at GIMM
+---
+
+
+@Xemium_in_Seurat (protocol availabe in https://satijalab.org/seurat/articles/seurat5_spatial_vignette_2)
+```{r}
+#Libraries and Xenium data loading (samples 6 and 8)
+
+library(Seurat)
+library(future)
+plan("multisession", workers = 10)
+library(ggplot2)
+library(plotly)
+library(arrow)
+options(future.globals.maxSize = 10 * 1024^3)
+
+#Load Objects
+xenium.obj6<-LoadXenium("C:\\Users\\fmmar\\OneDrive\\Documentos\\dados_Xenium_Projeto\\DATA_SLIDE_0053417\\output-XETG00289__0053417__6__20251209__105341",fov='fov',segmentations='cell')
+
+xenium.obj8<-LoadXenium("C:\\Users\\fmmar\\OneDrive\\Documentos\\dados_Xenium_Projeto\\DATA_SLIDE_0053417\\output-XETG00289__0053417__8__20251209__105341",fov='fov',segmentations='cell') 
+
+```
+
+
+#Sample 6
+#1. Quality Control
+
+
+```{r}
+#Add area to metadata
+area_vec = sapply(xenium.obj6@images$fov@boundaries$segmentations@polygons, function(x) x@area)
+names(area_vec) = colnames(xenium.obj6)
+xenium.obj6 = Seurat::AddMetaData(xenium.obj6, area_vec, col.name = "area")
+```
+
+```{r}
+#QC plots | nFeatures and nCounts
+Idents(xenium.obj6) <- "Sample1" #in fact it is sample 6 but for the report makes sense to be 1, since it's the first
+VlnPlot(xenium.obj6, features = c("nFeature_Xenium", "nCount_Xenium","area"), ncol = 3, pt.size=0)
+```
+
+
+
+```{r}
+#Valores máximos e mínimos para melhorar perceção
+length(xenium.obj6@meta.data$nCount_Xenium) #starting with 86690 cells
+
+max(xenium.obj6@meta.data$nFeature_Xenium) #1162
+median(xenium.obj6@meta.data$nFeature_Xenium) #104
+min(xenium.obj6@meta.data$nFeature_Xenium) #0
+
+max(xenium.obj6@meta.data$nCount_Xenium) #2138
+median(xenium.obj6@meta.data$nCount_Xenium) #121
+min(xenium.obj6@meta.data$nCount_Xenium) #0
+
+max(xenium.obj6@meta.data$area) #861.2421
+median(xenium.obj6@meta.data$area) #50.28138
+min(xenium.obj6@meta.data$area) #1.354694
+```
+
+
+#Lets see how this characteristics spread in space
+```{r}
+#nFeatures
+p<-ImageFeaturePlot(xenium.obj6, features ="nFeature_Xenium" , max.cutoff = 'q90', size = 0.5, cols = c("white", "red"))
+p + scale_size_area(max_size=2) #as the values increase the size of the mapped points increase
+
+#nCounts
+p<-ImageFeaturePlot(xenium.obj6, features ="nCount_Xenium" , max.cutoff = 'q90', size = 0.5, cols = c("white", "red"))
+p + scale_size_area(max_size=2) #as the values increase the size of the mapped points increase
+
+#cell size
+p<-ImageFeaturePlot(xenium.obj6, features ="area" , max.cutoff = 'q90', size = 0.5, cols = c("white", "red"))
+p + scale_size_area(max_size=2) #as the values increase the size of the mapped points increase
+```
+
+
+#Characteristics filtration
+
+```{r}
+#Shortcuts
+Counts<-xenium.obj6@meta.data$nCount_Xenium
+Features<-xenium.obj6@meta.data$nFeature_Xenium
+cells_size<-xenium.obj6@meta.data$area
+```
+
+R.: At this point we have 86690 cells.
+
+#Search for cells with characteristics outside of interquantile interval. 
+```{r}
+
+#Function to figuer out possible lower bond, since lb is giving negative values
+find_cutoffs <- function(characteristic) {
+  values<-xenium.obj6@meta.data[[characteristic]]
+  q1<-quantile(values)[2]
+  x_vector<-seq(1, q1, by = 1)
+  y_values<-sapply(x_vector,function(i) sum(values < i))
+  df <- data.frame( cutoff = x_vector, cells_below = y_values )
+  p <- ggplot(df, aes(x = cutoff, y = cells_below)) + geom_bar(stat = "identity", fill = "darkcyan") + labs( x = "Cutoff possível", y = "Nº de células abaixo do cutoff", title = paste("Curva de cutoffs para", characteristic) ) + theme_minimal()
+  ggplotly(p)
+} #characteristic is 'nFeature_Xenium', 'nCount_Xenium','area'
+
+quantile_multiplier<-2 #it is usual to use a value within 1.5 (moderate) and 3(severe). 2 is often used in studies.
+
+#nCounts
+q1<-unname(quantile(Counts)[2]) #56
+q3<-unname(quantile(Counts)[4]) #227
+iqr_Counts<-q3-q1
+find_cutoffs('nCount_Xenium') #min 15 counts, excluding 6021 cells
+lb_Counts<-15
+ub_Counts<-q3+quantile_multiplier*iqr_Counts #569, excluding 2039 cells
+
+n_excluded_qm_Counts<-sum(Counts<lb_Counts|Counts>ub_Counts) #8060 cells are outside range
+
+#nFeatures
+q1<-unname(quantile(Features)[2]) #51
+q3<-unname(quantile(Features)[4]) #186
+iqr_Features<-q3-q1
+find_cutoffs('nFeature_Xenium') #min 15 genes, excluding 6351 cells
+lb_Features<-15 
+ub_Features<-q3+quantile_multiplier*iqr_Features #456, excluding 1321 cells
+
+n_excluded_qm_Feature<-sum(Features<lb_Features|Features>ub_Features) #7672 cells are outside range
+
+#size
+q1<-unname(quantile(cells_size)[2]) #32.80575
+q3<-unname(quantile(cells_size)[4]) #78.05334
+iqr_sizes<-q3-q1
+find_cutoffs('area') #min 15 size, excluding 3810 cells
+lb_sizes<- 15
+ub_sizes<-q3+quantile_multiplier*iqr_sizes #168.3875, excluding 3324 cells
+
+n_excluded_qm_size<-sum(cells_size<lb_sizes|cells_size>ub_sizes) #7134 cells are outside range
+
+all_to_exclude<-subset(xenium.obj6, subset=((nCount_Xenium<lb_Counts|nCount_Xenium>ub_Counts)& (nFeature_Xenium<lb_Features|nFeature_Xenium>ub_Features)|(area<lb_sizes|area>ub_sizes))) #12650 cells to be excluded
+
+```
+
+#Perform exclusion
+
+```{r}
+xenium.filtered <- subset(xenium.obj6,cells = setdiff(colnames(xenium.obj6), colnames(all_to_exclude))) #74040 cells remaining is a reduction of 15%.
+
+```
+
+```{r}
+VlnPlot(xenium.filtered, features = c("nFeature_Xenium", "nCount_Xenium","area"), ncol = 3, alpha=0.01) # or pt.size=0
+```
+
+
+Vou seguir o seurat (https://satijalab.org/seurat/articles/seurat5_spatial_vignette_2) e vou fazer uma análise do tamanho celular  para perceber se existe correlação (graficamente) entre nFeature_Xenium e nCount_Xenium. A ideia é perceber também se devemos usar um upper cutf off no nCount_Xenium porque se a mediana de genes é 105 , mas existem nCount_Xenium bue altos (acima de 2000), o que ou podem ser células grandes ou doblets, e por isso deverá ser corrigido.
+
+```{r}
+#Lets see how nCounts and nFeatures impact the cluster segmentation
+#common steps
+
+xenium.obj6_test <- SCTransform(xenium.filtered, assay = "Xenium", verbose = FALSE)#negative control ehehe
+xenium.obj6_test <- RunPCA(xenium.obj6_test, npcs = 30, features = rownames(xenium.obj6_test)) 
+xenium.obj6_test <- RunUMAP(xenium.obj6_test, dims = 1:30)
+xenium.obj6_test <- FindNeighbors(xenium.obj6_test, reduction = "pca", dims = 1:30)
+xenium.obj6_test <- FindClusters(xenium.obj6_test, resolution = 0.3)
+
+#area
+xenium.obj_size <- SCTransform(xenium.filtered, assay = "Xenium", verbose = FALSE, vars.to.regress='area')
+xenium.obj_size <- RunPCA(xenium.obj_size, npcs = 30, features = rownames(xenium.obj_size)) 
+xenium.obj_size <- RunUMAP(xenium.obj_size, dims = 1:30)
+xenium.obj_size <- FindNeighbors(xenium.obj_size, reduction = "pca", dims = 1:30)
+xenium.obj_size <- FindClusters(xenium.obj_size, resolution = 0.3)
+
+#nFeatures
+xenium.obj_nF <- SCTransform(xenium.filtered, assay = "Xenium", verbose = FALSE, vars.to.regress='nFeature_Xenium')
+xenium.obj_nF <- RunPCA(xenium.obj_nF, npcs = 30, features = rownames(xenium.obj_nF)) 
+xenium.obj_nF <- RunUMAP(xenium.obj_nF, dims = 1:30)
+xenium.obj_nF <- FindNeighbors(xenium.obj_nF, reduction = "pca", dims = 1:30)
+xenium.obj_nF <- FindClusters(xenium.obj_nF, resolution = 0.3)
+
+#nCounts
+xenium.obj_nC <- SCTransform(xenium.filtered, assay = "Xenium", verbose = FALSE, vars.to.regress='nCount_Xenium')
+xenium.obj_nC <- RunPCA(xenium.obj_nC, npcs = 30, features = rownames(xenium.obj_nC)) 
+xenium.obj_nC <- RunUMAP(xenium.obj_nC, dims = 1:30)
+xenium.obj_nC <- FindNeighbors(xenium.obj_nC, reduction = "pca", dims = 1:30)
+xenium.obj_nC <- FindClusters(xenium.obj_nC, resolution = 0.3)
+
+
+DimPlot(xenium.obj, reduction = "umap")+ggtitle('UMAP without removing any variable')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj, reduction = "umap",features = "nFeature_Xenium")+ggtitle('UMAP before removing nFeatures')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_nF, reduction = "umap",features = "nFeature_Xenium")+ggtitle('UMAP after removing nFeatures')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj, reduction = "umap",features = "nCount_Xenium")+ggtitle('UMAP before removing nCounts')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_nC, reduction = "umap",features = "nCount_Xenium")+ggtitle('UMAP after removing nCounts')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj, reduction = "umap",features = "area")+ggtitle('UMAP before removing Area (cell size)')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_size, reduction = "umap",features = "area")+ggtitle('UMAP after removing Area (cell size)')+ theme(plot.title = element_text(hjust = 0.5))
+```
+Pelos FeaturePlots estas variáveis não aparentam causar uma divisão dos cluster, no entanto o nCounts até parece existir uma separação intraclusters. Para ter uma outra noção vou ver o gráfico do Diogo (principal component regression).
+
+```{r}
+#Principal component regression
+library(scater)
+pcs <- Embeddings(xenium.obj, "pca") #matriz com as células em cada PC
+xs <- c("nCount_Xenium","nFeature_Xenium","area")
+
+pcr <- lapply(xs, function(x) {
+    fit <- summary(lm(pcs ~ xenium.obj@meta.data[[x]]))
+    r2 <- sapply(fit, \(.) .$adj.r.squared)
+    data.frame(x, pc=seq_along(r2), r2)
+}) |> do.call(what=rbind)
+
+ggplot(pcr, aes(pc, r2, col=x)) +
+    geom_line() + geom_point() +
+    coord_cartesian(xlim=c(1, 20))
+```
+Codigo do plot (https://github.com/GIMM-BioCode/2025-Autumn-School-for-Single-Cell-ers/tree/main/Day2_Muscat-Milo)
+
+```{r}
+library(plotly)
+ggplotly(ElbowPlot(xenium.obj,ndims=50))
+```
+
+
+#2 Data analysis
+
+```{r}
+#For marker localization
+ImageDimPlot(xenium.obj, fov = "fov", molecules = c("Gad1", "Sst", "Pvalb", "Gfap"), nmols = 20000)
+```
+```{r}
+#For markers levels of expression
+ImageFeaturePlot(xenium.obj, features = c("Cux2", "Rorb", "Bcl11b", "Foxp2"), max.cutoff = c(25,35, 12, 10), size = 0.75, cols = c("white", "red"))
+```
+```{r}
+cropped.coords <- Crop(xenium.obj[["fov"]], x = c(1200, 2900), y = c(3750, 4550), coords = "plot")
+xenium.obj[["zoom"]] <- cropped.coords # we are now working with 3958 cells
+
+# visualize cropped area with cell segmentations & selected molecules
+DefaultBoundary(xenium.obj[["zoom"]]) <- "segmentation"
+ImageDimPlot(xenium.obj, fov = "zoom", axes = TRUE, border.color = "white", border.size = 0.1, cols = "polychrome",
+    coord.fixed = FALSE, molecules = c("Gad1", "Sst", "Npy2r", "Pvalb", "Nrn1"), nmols = 10000)
+```
+
+
+#Normalization, linear and non-linear Dimensional reduction, Neighbor Joining and Clustering
+```{r}
+xenium.obj <- SCTransform(xenium.obj, assay = "Xenium") #Normalization e scale ; ir experimentando diferentes valores para o variable.features.n e variable.features.rv.th, mas o mais interessante será tendo-os igual a NULL. Ver o vars.to.regress= para nCount e nFeatures cell size e ver como impacta a distribuição no UMAP (se antes estavam separados consoante alguma destas variáveis e após o regress, que no fundo remove-as, já não estão então é porque estavam a causar bias)
+xenium.obj <- RunPCA(xenium.obj, npcs = 30, features = rownames(xenium.obj)) 
+xenium.obj <- RunUMAP(xenium.obj, dims = 1:30)
+xenium.obj <- FindNeighbors(xenium.obj, reduction = "pca", dims = 1:30)
+xenium.obj <- FindClusters(xenium.obj, resolution = 0.3)
+```
+Duvidas:
+Por responder:
+
+Respondidas:
+Não fazemos o scaling, após o PCA? Não, embora o SCTransform faça Normalização (divide counts pelos pelos total counts), faz uma parte do scaling (falando do processo geral), que é o centering (dividir pela media), mas não faz a substração do desvio padrão (também designado de scaling), no entanto este último segundo o Tomás não será relevante.  Não usamos elbow plot e ficamos com os PCs defaults? Usamos sim.
+Vale a pena usar clustree para averiguar se a resolution está correta? Vale.
+O UMAP não deu igual e tem um cluster a menos, é normal? É
+As cores das ImageDimPlot estão muito diferentes das da vignette. é das bordas dos circulos serem brancas.
+
+Coisas a fazer depois de ter as duvidas respondidas:
+->ir experimentando diferentes valores para o variable.features.n e variable.features.rv.th, mas o mais interessante será tendo-os igual a NULL (quando tiver o dataset). 
+->Ver o vars.to.regress= para nCount e nFeature, cell size e ver como impacta a distribuição no UMAP (se antes estavam separados consoante alguma destas variáveis e após o regress, que no fundo remove-as, já não estão então é porque estavam a causar bias. FEITO
+->elbowplot antes do PCA . package (elbow), func (elbow), fiz com a func que conhecia
+->clustree 
+->remover as bordas brancas dos circulos
+-> Curti bue do ggplotly() do library(plotly), para graficos interativos.
+
+```{r}
+#visualize the results of the clustering by coloring each cell according to its cluster in UMAP space
+DimPlot(xenium.obj, reduction = 'umap')
+```
+
+```{r}
+# Visualize the expression level of the markers we looked at earlier on the UMAP coordinates.
+
+FeaturePlot(xenium.obj, features = c("Cux2", "Bcl11b", "Foxp2", "Gad1", "Sst", "Gfap"))
+```
+```{r}
+# Visualize the cell positions colored by the cluster labels determined in the previous step.
+
+p<-ImageDimPlot(xenium.obj, cols = "polychrome", size = 0.75)
+library(plotly)
+ggplotly(p)
+```
+
+
+
+```{r}
+#Another way to see a specific region
+par(mfrow=c(2,1))
+p1 <- ImageFeaturePlot(xenium.obj, features = "Slc17a7", axes = TRUE, max.cutoff = "q90")
+crop <- Crop(xenium.obj[["fov"]], x = c(600, 2100), y = c(900, 4700))
+xenium.obj[["crop"]] <- crop
+p2 <- ImageFeaturePlot(xenium.obj, fov = "crop", features = "Slc17a7", size = 1, axes = TRUE, max.cutoff = "q90")
+p1
+p2
+```
+
+#Decomposition
+
+```{r}
+#Install RCTD (for cell anotation)
+devtools::install_github("dmcable/spacexr", build_vignettes = FALSE)
+```
+
+```{r}
+library(spacexr)
+
+query.counts <- GetAssayData(xenium.obj, assay = "Xenium", layer = "counts")[, Cells(xenium.obj[["fov"]])]
+coords <- GetTissueCoordinates(xenium.obj[["fov"]], which = "centroids")
+rownames(coords) <- coords$cell
+coords$cell <- NULL
+query <- SpatialRNA(coords, query.counts, colSums(query.counts)) #Returns SpatialRNA object containing the coordinates and counts from the input file
+```
+
+```{r}
+allen.cortex.ref <-readRDS("C:\\Users\\fmmar\\OneDrive\\Ambiente de Trabalho\\Universidade\\Mestrado\\1º Ano\\Periodo Intercalar\\Multi-Omics Project\\data\\testing the script\\allen_cortex.rds")
+allen.cortex.ref <- UpdateSeuratObject(allen.cortex.ref)
+
+Idents(allen.cortex.ref) <- "subclass"
+# remove CR cells because there aren't enough of them for annotation
+allen.cortex.ref <- subset(allen.cortex.ref, subset = subclass != "CR")
+counts <- GetAssayData(allen.cortex.ref, assay = "RNA", layer = "counts")
+cluster <- as.factor(allen.cortex.ref$subclass)
+names(cluster) <- colnames(allen.cortex.ref)
+nUMI <- allen.cortex.ref$nCount_RNA
+names(nUMI) <- colnames(allen.cortex.ref)
+nUMI <- colSums(counts)
+levels(cluster) <- gsub("/", "-", levels(cluster))
+reference <- Reference(counts, cluster, nUMI)
+```
+
+```{r}
+RCTD <- create.RCTD(query, reference, max_cores = 8)
+RCTD <- run.RCTD(RCTD, doublet_mode = "doublet")
+annotations.df <- RCTD@results$results_df
+annotations <- annotations.df$first_type
+names(annotations) <- rownames(annotations.df)
+xenium.obj$predicted.celltype <- annotations
+keep.cells <- Cells(xenium.obj)[!is.na(xenium.obj$predicted.celltype)]
+xenium.obj <- subset(xenium.obj, cells = keep.cells)
+```
+#Niches (Cell type composition of the neighbourhood of each cell)
+
+```{r}
+xenium.obj <- BuildNicheAssay(object = xenium.obj, fov = "fov", group.by = "predicted.celltype",niches.k = 5, neighbors.k = 30)
+```
+
+```{r}
+#classification of cell groups eith based on their cell type or thei niche identity
+celltype.plot <- ImageDimPlot(xenium.obj, group.by = "predicted.celltype", size = 1.5, cols = "polychrome",
+    dark.background = F) + ggtitle("Cell type")
+niche.plot <- ImageDimPlot(xenium.obj, group.by = "niches", size = 1.5, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("#442288", "#6CA2EA", "#B5D33D", "#FED23F", "#EB7D5B"))
+celltype.plot | niche.plot
+```
+
+
+#composition of each niche is enriched for distinct cell types.
+```{r}
+table(xenium.obj$predicted.celltype, xenium.obj$niches)
+
+```
+
