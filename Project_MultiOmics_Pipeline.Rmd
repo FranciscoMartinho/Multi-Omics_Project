@@ -1,0 +1,561 @@
+---
+Title: "MultiOmics_Project_Pipeline"
+Author: Francisco Martinho | 73349
+Supervisor: Tomás Gomes
+Place: Luis Graça Lab at GIMM
+---
+
+@_Get_started
+
+```{r}
+#Load required libraries 
+
+library(arrow)     # version 19.0.1.1
+library(clustree)  # version 0.5.1
+library(future)    # version 1.68.0
+library(ggplot2)   # version 4.0.1
+library(glmGamPoi) # version 1.22.0
+library(plotly)    # version 4.11.0
+library(scater)    # version 1.38.0
+library(Seurat)    # version 5.4.1
+library(spacexr)   # version 2.2.1
+
+#Computational demand commands
+
+plan("multisession", workers = 10)
+options(future.globals.maxSize = 1.0 * 10^60000000000000000000000000000000) #crucial command
+
+```
+
+```{r}
+#Load Objects
+
+file_dir<-"xenium_path"
+xenium.obj<-LoadXenium(file_dir,fov='fov',segmentations='cell')
+```
+
+
+```{r}
+#Add area to metadata
+area_vec = sapply(xenium.obj@images$fov@boundaries$segmentations@polygons, function(x) x@area)
+names(area_vec) = colnames(xenium.obj)
+xenium.obj = Seurat::AddMetaData(xenium.obj, area_vec, col.name = "area")
+```
+
+
+@_Quality_Control
+
+```{r}
+#QC plots | nFeatures and nCounts
+VlnPlot(xenium.obj, features = c("nFeature_Xenium", "nCount_Xenium","area"), ncol = 3, pt.size=0)
+```
+
+
+```{r}
+#Range of values in each parameter
+
+length(xenium.obj@meta.data$nCount_Xenium) #starting with N cells
+
+# nFeature
+max(xenium.obj@meta.data$nFeature_Xenium) 
+median(xenium.obj@meta.data$nFeature_Xenium) 
+min(xenium.obj@meta.data$nFeature_Xenium) 
+
+# nCount
+max(xenium.obj@meta.data$nCount_Xenium) 
+median(xenium.obj@meta.data$nCount_Xenium) 
+min(xenium.obj@meta.data$nCount_Xenium) 
+
+# cell_size
+max(xenium.obj@meta.data$area) 
+median(xenium.obj@meta.data$area) 
+min(xenium.obj@meta.data$area) 
+```
+
+
+#Identification of cells with extremely high or low values for each parameter
+
+```{r}
+#Shortcuts
+
+Counts<-xenium.obj@meta.data$nCount_Xenium
+Features<-xenium.obj@meta.data$nFeature_Xenium
+cells_size<-xenium.obj@meta.data$area
+```
+
+```{r}
+
+#Function to find lower threshold
+
+find_lower_cutoffs <- function(characteristic){
+  values<-xenium.obj@meta.data[[characteristic]]
+  q1<-quantile(values)[2]
+  x_vector<-seq(1, q1, by = 1)
+  y_values<-sapply(x_vector,function(i) sum(values<i))
+  df<-data.frame(cutoff=x_vector, cells_below=y_values)
+  p<-ggplot(df, aes(x=cutoff, y=cells_below))+geom_bar(stat="identity", fill="darkcyan") + labs(x="Cutoff possível", y= "Number of cells below the cutoff", title=paste("Find lower threshold for", characteristic) ) + theme_minimal()
+  ggplotly(p)
+}
+
+#Constant required to calculate upper threshold 
+quantile_multiplier<-2 #often used values between 1.5 (moderate) and 3(severe). 2 is commonly used in studies.
+
+
+# 1) Finding thresholds for each parameter
+
+#nCounts
+q1<-unname(quantile(Counts)[2]) 
+q3<-unname(quantile(Counts)[4]) 
+iqr_Counts<-q3-q1
+find_lower_cutoffs('nCount_Xenium') #generates an interactive graph in "Viewer", to better choose the lower threshold
+lb_Counts<-15 #chosen threshold
+ub_Counts<-q3+quantile_multiplier*iqr_Counts 
+
+#nFeatures
+q1<-unname(quantile(Features)[2]) 
+q3<-unname(quantile(Features)[4]) 
+iqr_Features<-q3-q1
+find_lower_cutoffs('nFeature_Xenium') 
+lb_Features<-15 
+ub_Features<-q3+quantile_multiplier*iqr_Features 
+
+#cell_size
+q1<-unname(quantile(cells_size)[2]) 
+q3<-unname(quantile(cells_size)[4]) 
+iqr_sizes<-q3-q1
+find_lower_cutoffs('area') 
+lb_sizes<- 15
+ub_sizes<-q3+quantile_multiplier*iqr_sizes 
+
+# 2) Identification of cells to exclude
+all_to_exclude<-subset(xenium.obj, subset=((nCount_Xenium<lb_Counts|nCount_Xenium>ub_Counts)& (nFeature_Xenium<lb_Features|nFeature_Xenium>ub_Features)|(area<lb_sizes|area>ub_sizes))) 
+
+```
+
+
+#Perform cell exclusion
+
+```{r}
+
+xenium.obj_filtered <- subset(xenium.obj,cells = setdiff(colnames(xenium.obj), colnames(all_to_exclude))) 
+
+```
+
+
+@_Sample_processing
+
+#Evaluate parameters' impact on dataset's variability | Part 1 - Feature Plots
+
+```{r}
+
+# Negative Control
+xenium.obj_basis <- SCTransform(xenium.obj_filtered, assay = "Xenium")
+xenium.obj_basis <- RunPCA(xenium.obj_basis, npcs = 30, features = rownames(xenium.obj_basis)) 
+xenium.obj_basis <- RunUMAP(xenium.obj_basis, dims = 1:30)
+xenium.obj_basis <- FindNeighbors(xenium.obj_basis, reduction = "pca", dims = 1:30)
+
+# REGRESS:
+# area
+xenium.obj_size <- SCTransform(xenium.obj_filtered, assay = "Xenium", vars.to.regress='area')
+xenium.obj_size <- RunPCA(xenium.obj_size, npcs = 30, features = rownames(xenium.obj_size)) 
+xenium.obj_size <- RunUMAP(xenium.obj_size, dims = 1:30)
+xenium.obj_size <- FindNeighbors(xenium.obj_size, reduction = "pca", dims = 1:30)
+xenium.obj_size <- FindClusters(xenium.obj_size, resolution = 0.3)
+
+# nFeatures
+xenium.obj_nF <- SCTransform(xenium.obj_filtered, assay = "Xenium", vars.to.regress='nFeature_Xenium')
+xenium.obj_nF <- RunPCA(xenium.obj_nF, npcs = 30, features = rownames(xenium.obj_nF)) 
+xenium.obj_nF <- RunUMAP(xenium.obj_nF, dims = 1:30)
+xenium.obj_nF <- FindNeighbors(xenium.obj_nF, reduction = "pca", dims = 1:30)
+xenium.obj_nF <- FindClusters(xenium.obj_nF, resolution = 0.3)
+
+# nCounts
+xenium.obj_nC <- SCTransform(xenium.obj_filtered, assay = "Xenium", vars.to.regress='nCount_Xenium')
+xenium.obj_nC <- RunPCA(xenium.obj_nC, npcs = 30, features = rownames(xenium.obj_nC)) 
+xenium.obj_nC <- RunUMAP(xenium.obj_nC, dims = 1:30)
+xenium.obj_nC <- FindNeighbors(xenium.obj_nC, reduction = "pca", dims = 1:30)
+xenium.obj_nC <- FindClusters(xenium.obj_nC, resolution = 0.3)
+
+```
+
+```{r}
+#Save Objects
+
+file_dir<-"xenium_path"
+
+saveRDS(xenium.obj_filtered, paste0(file_dir,"xenium.obj_filtered.rds"))
+saveRDS(xenium.obj_basis, paste0(file_dir, "xenium.obj_basis.rds"))
+saveRDS(xenium.obj_size, paste0(file_dir, "xenium.obj_size.rds"))
+saveRDS(xenium.obj_nF, paste0(file_dir, "xenium.obj_nF.rds"))
+saveRDS(xenium.obj_nC, paste0(file_dir, "xenium.obj_nC.rds"))
+
+```
+
+```{r}
+#Load the objects
+
+xenium.obj_filtered <- readRDS(paste0(file_dir, "xenium.obj_filtered.rds"))
+xenium.obj_basis <- readRDS(paste0(file_dir, "xenium.obj_basis.rds"))
+xenium.obj_size <- readRDS(paste0(file_dir, "xenium.obj_size.rds"))
+xenium.obj_nF <- readRDS(paste0(file_dir, "xenium.obj_nF.rds"))
+xenium.obj_nC <- readRDS(paste0(file_dir, "xenium.obj_nC.rds"))
+
+```
+
+```{r}
+#Visualize cell dispersion while highlighting each parameter
+
+# nFeature
+FeaturePlot(xenium.obj_basis, reduction = "umap",features = "nFeature_Xenium")+ggtitle('UMAP before removing nFeatures')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_nF, reduction = "umap",features = "nFeature_Xenium")+ggtitle('UMAP after removing nFeatures')+ theme(plot.title = element_text(hjust = 0.5))
+
+# nCount
+FeaturePlot(xenium.obj_test, reduction = "umap",features = "nCount_Xenium")+ggtitle('UMAP before removing nCounts')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_nC, reduction = "umap",features = "nCount_Xenium")+ggtitle('UMAP after removing nCounts')+ theme(plot.title = element_text(hjust = 0.5))
+
+# cell_size
+FeaturePlot(xenium.obj_test, reduction = "umap",features = "area")+ggtitle('UMAP before removing Area (cell size)')+ theme(plot.title = element_text(hjust = 0.5))
+FeaturePlot(xenium.obj_size, reduction = "umap",features = "area")+ggtitle('UMAP after removing Area (cell size)')+ theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+#Evaluate parameters' impact on dataset's variability | Part 2 - Correlation Plot
+
+Note: Code adapted from https://github.com/GIMM-BioCode/2025-Autumn-School-for-Single-Cell-ers/tree/main/Day2_Muscat-Milo
+
+```{r}
+
+pcs <- Embeddings(xenium.obj_basis, "pca") #matrix with the cells in each PC
+xs <- c("nCount_Xenium","nFeature_Xenium","area")
+
+pcr <- lapply(xs, function(x) {
+    fit <- summary(lm(pcs ~ xenium.obj_basis@meta.data[[x]]))
+    r2 <- sapply(fit, \(.) .$adj.r.squared)
+    data.frame(x, pc=seq_along(r2), r2)
+}) |> do.call(what=rbind)
+
+ggplot(pcr, aes(pc, r2, col=x)) +
+    geom_line() + geom_point() +
+    coord_cartesian(xlim=c(1, 20))+ labs(title = "Variance Explained by nCount, nFeature and Cell Area Across PCs")
+```
+
+
+@_Clustree_Analysis
+
+```{r}
+#Find the best resolution for clustering
+CAFs <- FindClusters(xenium.obj_filtered, verbose = TRUE, resolution = c(0, 0.1, 0.2, 0.3, 0.4, 0.5,0.6,0.7,0.8,0.9,1))
+p<-clustree(CAFs)
+
+#Save plot as png
+file_dir<-"xenium_path"
+ggplot2::ggsave( filename = file_dir + "clustree_plot.png", plot = p, width = 10, height = 8, dpi = 300)
+```
+
+
+@_ElbowPlot_Analysis
+
+```{r}
+#Examine the amount of PCs necessary
+ggplotly(ElbowPlot(xenium.obj_filtered,ndims=30)) 
+
+```
+
+
+```{r}
+#Combine the best resolution with the regressions and amount of PCs needed
+
+xenium.obj_size_Counts <- SCTransform(xenium.obj_filtered, assay = "Xenium", vars.to.regress=c('nCount_Xenium','area'))
+xenium.obj_size_Counts <- RunPCA(xenium.obj_size_Counts, npcs = 30, features = rownames(xenium.obj_size_Counts)) 
+xenium.obj_size_Counts <- RunUMAP(xenium.obj_size_Counts, dims = 1:30)
+xenium.obj_size_Counts <- FindNeighbors(xenium.obj_size_Counts, reduction = "pca", dims = 1:30)
+xenium.obj_size_Counts <- FindClusters(xenium.obj_size_Counts, resolution = 0.5)
+
+```
+
+
+```{r}
+#Save Object
+
+file_dir<- "xenium_path"
+saveRDS(xenium.obj_size_Counts, paste0(file_dir, "xenium.obj_size_Counts.rds"))
+```
+
+```{r}
+#Load Object
+
+file_dir<-"xenium_path"
+xenium.obj_size_Counts<-LoadXenium(file_dir,fov='fov',segmentations='cell')
+
+```
+
+
+@_Decomposition
+
+#Creating Spatial Object with tissue information
+```{r}
+
+query.counts <- GetAssayData(xenium.obj_size_Counts, assay = "Xenium", layer = "counts")[,Cells(xenium.obj_size_Counts[["fov"]])]
+coords <- GetTissueCoordinates(xenium.obj_size_Counts[["fov"]], which = "centroids")
+rownames(coords) <- coords$cell
+coords$cell <- NULL
+
+query<- SpatialRNA(coords, query.counts, colSums(query.counts)) #Returns SpatialRNA object containing the coordinates and counts from the input file
+
+```
+
+
+#Creating Reference Object with scRNA-seq cell annotations
+```{r}
+
+file_dir<-"path_example"
+lab.ref_pos<-readRDS( file_dir + "cd45pos_annotated_clean.RDS")
+lab.ref_neg<-readRDS( file_dir + "cd45neg_annotated_clean.RDS")
+
+
+#Merge both objects
+merged_lab_ref<-merge(lab.ref_pos, y=lab.ref_neg, add.cell.ids=c("POS", "NEG"))
+
+merged_lab_ref <- UpdateSeuratObject(merged_lab_ref)
+
+Idents(merged_lab_ref) <- "major_annot_joint"  #choose annotation pretended
+
+table(merged_lab_ref@active.ident) # For RCTD to work all annotations need to have matched with at least 25 cells. 
+
+#remove if lower than 25
+#merged_lab_ref <- subset(merged_lab_ref, subset = major_annot_joint != "Immune_cells")
+
+counts <- GetAssayData(merged_lab_ref, assay = "SCT", layer = "counts")
+
+cluster <- as.factor(merged_lab_ref$major_annot_joint)
+
+names(cluster) <- colnames(merged_lab_ref)
+
+nUMI <- merged_lab_ref$nCount_RNA
+
+names(nUMI) <- colnames(merged_lab_ref)
+
+nUMI <- colSums(counts)
+
+levels(cluster) <- gsub("/", "-", levels(cluster))
+
+reference <- Reference(counts, cluster, nUMI)
+
+```
+
+#Perform Robust Cell Type Decomposition
+```{r}
+
+RCTD<- create.RCTD(query, reference, max_cores = 8)
+
+RCTD<- run.RCTD(RCTD, doublet_mode = "doublet")
+
+```
+
+
+```{r}
+
+#Save Object
+
+file_dir <- "example_path"
+saveRDS(RCTD, paste0(file_dir,"RCTD.rds"))
+
+```
+
+```{r}
+
+#Load Object
+
+file_dir <- "example_path"
+RCTD<-readRDS(paste0(file_dir, "RCTD.rds"))
+
+```
+
+
+```{r}
+
+#Obtain Dataset with annotated cells
+
+annotations.df <- RCTD@results$results_df
+annotations <- annotations.df$first_type
+names(annotations) <- rownames(annotations.df)
+xenium.obj_size_Counts$predicted.celltype <- annotations
+keep.cells <- Cells(xenium.obj_size_Counts)[!is.na(xenium.obj_size_Counts$predicted.celltype)]
+xenium.obj_size_Counts <- subset(xenium.obj_size_Counts, cells = keep.cells)
+
+```
+
+```{r}
+
+#Save Object
+
+file_dir<- "example_path"
+saveRDS(xenium.obj_size_Counts_cell_types, paste0(file_dir,"xenium.obj_size_Counts_cell_types.rds"))
+
+```
+
+```{r}
+
+#Load Object
+
+file_dir <- "example_path"
+xenium.obj_size_Counts_cell_types<-readRDS(paste0(file_dir,"xenium.obj_size_Counts_cell_types.rds"))
+
+```
+
+
+@_Generating_Domains
+
+```{r}
+
+xenium.obj_size_Counts_nich3 <- BuildNicheAssay(object = xenium.obj_size_Counts_cell_types, fov = "fov", group.by = "predicted.celltype",niches.k = 3, neighbors.k = 30)
+
+xenium.obj_size_Counts_nich4 <- BuildNicheAssay(object = xenium.obj_size_Counts_cell_types, fov = "fov", group.by = "predicted.celltype",niches.k = 4, neighbors.k = 30)
+
+xenium.obj_size_Counts_nich5 <- BuildNicheAssay(object = xenium.obj_size_Counts_cell_types, fov = "fov", group.by = "predicted.celltype",niches.k = 5, neighbors.k = 30)
+
+```
+
+
+#Visualization
+
+
+```{r}
+# Creating graphs to analyse cell type distribution across the tissue
+
+all_cell_types_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="lightgrey","B cells"="grey1","CD4"="red", "CD8"="deeppink", "Ductal_cells"="chartreuse1", "Endothelial_cells"="blue1","Fibroblasts"="orange","gd-NK"="darkmagenta","Mono-Mac"="cyan","Mural"="seagreen","Neuronal_cells"="#FED23F","Plasma cells" ="purple1","Proliferating cells"="brown")) + theme(plot.title = element_text(hjust = 0.65), legend.position = "bottom", legend.text = element_text(size = 7), legend.title = element_text(size = 0),legend.direction = "horizontal")
+
+Acinar_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="lightgrey","B cells"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","CD4"="cornsilk2")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+Bcell_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="grey1", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","CD4"="cornsilk2")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+CD4_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","CD4"="red")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+CD8_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","CD8"="deeppink")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+Ductal_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","Ductal_cells"="chartreuse1","Endothelial_cells"="cornsilk2")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+Endothelial_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","Ductal_cells"="cornsilk2","Endothelial_cells"="blue1")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+Fibroblast_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","Fibroblasts"="orange")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+gdNk_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","gd-NK"="darkmagenta")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+MonoMac_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","Mono-Mac"="cyan")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+Mural_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","Mural"="seagreen")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+Neuronal_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="cornsilk2","Neuronal_cells"="#FED23F")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+Plasma_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Proliferating cells"="cornsilk2","Plasma cells"="purple1")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+Prolif_plot <- ImageDimPlot( xenium.obj_size_Counts_cell_types, group.by = "predicted.celltype", size = 1, dark.background = FALSE ) + scale_fill_manual(name= "Predicted Cell Type", values = c("Acinar_cells"="cornsilk2","B cells"="cornsilk2","CD4"="cornsilk2", "CD8"="cornsilk2", "Ductal_cells"="cornsilk2", "Endothelial_cells"="cornsilk2","Fibroblasts"="cornsilk2","gd-NK"="cornsilk2","Mono-Mac"="cornsilk2","Mural"="cornsilk2","Neuronal_cells"="cornsilk2","Plasma cells"="cornsilk2","Proliferating cells"="brown")) + theme(plot.title = element_text(hjust = 0.5))+theme(legend.position = "none")
+
+```
+
+```{r}
+
+#Save each map as png
+
+file_dir <- "example_path"
+png(
+  filename = paste0(file_dir, "teste.png"),
+  width = 2000, height = 1500, res = 300
+)
+
+print(Prolif_plot)
+
+dev.off()
+
+```
+
+
+```{r}
+
+# Creating graphs to analyse Niche (domains) distribution across the tissue
+
+niche.plot_3 <- ImageDimPlot(xenium.obj_size_Counts_cell_types, group.by = "niches", size = 1, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("1" ="#FED23F","2"="#6CA2EA", "3"="#B5D33D"))
+
+niche_plot_4 <- ImageDimPlot(xenium.obj_size_Counts_cell_types, group.by = "niches", size = 1, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("1" ="#B5D33D","2"="#FED23F", "3"="#442288","4"="#6CA2EA"))
+
+niche_plot_5 <- ImageDimPlot(xenium.obj_size_Counts_cell_types, group.by = "niches", size = 1, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("1" ="#442288","2"="#6CA2EA", "3"="#EB7D5B","4"="#B5D33D", "5"= "#FED23F"))
+
+
+```
+
+```{r}
+
+#Save each map as png
+
+file_dir <- "example_path"
+
+png( filename = paste0(file_dir, "teste.png"),
+     width = 3000, height = 3000, res = 300 )
+print(niche_plot_5)
+dev.off()
+
+```
+
+
+```{r}
+
+#Highlight each niche
+
+
+niche1.plot5 <- ImageDimPlot(niche_plot_5, group.by = "niches", size = 1, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("1" ="#442288","2"="grey", "3"="grey","4"="grey", "5"= "grey"))
+
+niche2.plot5 <- ImageDimPlot(niche_plot_5, group.by = "niches", size = 1, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("1" ="grey","2"="#6CA2EA", "3"="grey","4"="grey", "5"= "grey"))
+
+niche3.plot5 <- ImageDimPlot(niche_plot_5, group.by = "niches", size = 1, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("1" ="grey","2"="grey", "3"="#EB7D5B","4"="grey", "5"= "grey"))
+
+niche4.plot5 <- ImageDimPlot(niche_plot_5, group.by = "niches", size = 1, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("1" ="grey","2"="grey", "3"="grey","4"="#B5D33D", "5"= "grey"))
+
+niche5.plot5 <- ImageDimPlot(niche_plot_5, group.by = "niches", size = 1, dark.background = F) + ggtitle("Niches") +
+    scale_fill_manual(values = c("1" ="grey","2"="grey", "3"="grey","4"="grey", "5"= "#FED23F"))
+
+```
+
+
+```{r}
+
+#Save each map as png
+
+file_dir <- "example_path"
+png( filename = paste0(file_dir, "niche1.plot_3.png"), width = 2000, height = 2000, res = 300 )
+print(niche5.plot5)
+dev.off()
+
+```
+
+
+```{r}
+#Analyse Cell type composition of each niche.
+tab<-table(xenium.obj_size_Counts_cell_types$predicted.celltype, xenium.obj_size_Counts_nich5$niches)
+
+```
+
+
+```{r}
+
+#Construct the Stacked barplot
+
+tab_rel<-prop.table(tab, margin = 2)
+
+df <- as.data.frame(tab_rel)
+names(df) <- c("celltype", "niche", "Freq")
+
+  
+  
+cols <- c("Acinar_cells"="lightgrey","B cells"="grey1","CD4"="red","CD8"="deeppink","Ductal_cells"="chartreuse1","Endothelial_cells"="blue1","Fibroblasts"="orange","gd-NK"="darkmagenta","Mono-Mac"="cyan","Mural"="seagreen","Neuronal_cells"="#FED23F","Plasma cells"="purple1","Proliferating cells"="brown")
+
+ggplot(df, aes(x = niche, y = Freq, fill = celltype)) + geom_bar(position="stack", stat = "identity") + scale_fill_manual(values = cols) + theme_minimal()
+
+```
